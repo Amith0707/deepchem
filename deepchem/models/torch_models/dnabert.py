@@ -1,103 +1,94 @@
-from typing import Dict, Any, Tuple, Optional
-from deepchem.models.torch_models.hf_models import HuggingFaceModel
-from transformers import AutoModel, AutoTokenizer
-from transformers.modeling_utils import PreTrainedModel
+import importlib
+import numpy as np
+import torch
+from typing import Any, Tuple
 
-try:
-    import torch
-    import torch.nn as nn
-    import numpy as np
-    has_torch = True
-except:
-    has_torch = False
+from transformers import AutoConfig, AutoTokenizer
+from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
 
 class DNABERTModel(HuggingFaceModel):
-
     def __init__(
         self,
         task: str,
         model_name: str = "zhihan1996/DNABERT-2-117M",
         n_tasks: int = 1,
-        **kwargs
+        **kwargs,
     ):
-        self.task = task
         self.n_tasks = n_tasks
 
         tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True
+            model_name, trust_remote_code=True
         )
 
-        # Load backbone ONLY
-        backbone = AutoModel.from_pretrained(
-            model_name,
-            trust_remote_code=True
+        config = AutoConfig.from_pretrained(
+            model_name, trust_remote_code=True
         )
 
-        hidden_size = backbone.config.hidden_size
-
-        # Attach head manually
-        if task == "classification":
-            num_labels = 2 if n_tasks == 1 else n_tasks
-            self.classifier = nn.Linear(hidden_size, num_labels)
-
-        elif task == "regression":
-            self.classifier = nn.Linear(hidden_size, n_tasks)
-
+        if task == "mlm":
+            class_key = "AutoModelForMaskedLM"
         else:
-            raise ValueError("Invalid task")
+            class_key = "AutoModelForSequenceClassification"
 
-        self.backbone = backbone
+        if class_key not in config.auto_map:
+            raise ValueError(
+                f"{class_key} not found in config.auto_map."
+            )
+
+        mapping = config.auto_map[class_key]
+        _, class_path = mapping.split("--")
+        module_name, class_name = class_path.rsplit(".", 1)
+
+        base_module = config.__class__.__module__.rsplit(".", 1)[0]
+        full_module_path = f"{base_module}.{module_name}"
+
+        module = importlib.import_module(full_module_path)
+        model_class = getattr(module, class_name)
+
+        if task == "classification":
+            config.num_labels = 2 if n_tasks == 1 else n_tasks
+        elif task == "regression":
+            config.num_labels = n_tasks
+            config.problem_type = "regression"
+
+        model = model_class.from_pretrained(
+            model_name,
+            config=config,
+            trust_remote_code=True,
+        )
 
         super(DNABERTModel, self).__init__(
-            model=backbone,   # pass backbone to parent
+            model=model,
             task=task,
             tokenizer=tokenizer,
-            **kwargs
+            **kwargs,
         )
 
     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
+        X, y, w = batch
 
-        sequences_batch, y, w = batch
-
-        if isinstance(sequences_batch, np.ndarray):
-            sequences_list = sequences_batch.tolist()
-        else:
-            sequences_list = list(sequences_batch)
+        X_flat = np.array(X).ravel().tolist()
 
         tokens = self.tokenizer(
-            sequences_list,
+            X_flat,
             padding=True,
             truncation=True,
-            return_tensors="pt"
+            max_length=512,
+            return_tensors="pt",
         )
 
-        for key in tokens:
-            tokens[key] = tokens[key].to(self.device)
+        inputs = {k: v.to(self.device) for k, v in tokens.items()}
 
-        outputs = self.backbone(**tokens)
-        pooled_output = outputs.last_hidden_state[:, 0, :]  # CLS token
-        logits = self.classifier(pooled_output)
-
-        loss = None
+        y_tensor = None
 
         if y is not None:
-            y_tensor = torch.from_numpy(y)
+            y_tensor = torch.from_numpy(np.asarray(y)).to(self.device)
 
-            if self.task == "regression":
-                y_tensor = y_tensor.float().to(self.device)
-                loss_fct = nn.MSELoss()
-                loss = loss_fct(logits.squeeze(), y_tensor)
+            if self.task == "classification" and self.n_tasks == 1:
+                y_tensor = y_tensor.view(-1).long()
+            else:
+                y_tensor = y_tensor.float()
 
-            elif self.task == "classification":
-                if self.n_tasks == 1:
-                    y_tensor = y_tensor.long().to(self.device)
-                    loss_fct = nn.CrossEntropyLoss()
-                    loss = loss_fct(logits, y_tensor)
-                else:
-                    y_tensor = y_tensor.float().to(self.device)
-                    loss_fct = nn.BCEWithLogitsLoss()
-                    loss = loss_fct(logits, y_tensor)
+            inputs["labels"] = y_tensor
 
-        return {"loss": loss, "logits": logits}, y, w
+        return inputs, y_tensor, w
