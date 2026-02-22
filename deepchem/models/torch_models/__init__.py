@@ -68,6 +68,7 @@ except ModuleNotFoundError as e:
     )
 try:
     from deepchem.models.torch_models.hf_models import HuggingFaceModel
+    from deepchem.models.torch_models.dnabert import DNABERTModel
     from deepchem.models.torch_models.chemberta import Chemberta
     from deepchem.models.torch_models.molformer import MoLFormer
     from deepchem.models.torch_models.prot_bert import ProtBERT
