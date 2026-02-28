@@ -237,13 +237,34 @@ class DNABERT2(object):
         self.model_name = model_name
 
         from transformers import (
-            AutoConfig,
-            AutoModel,
+            AutoModel,AutoConfig,
             AutoModelForMaskedLM,
             AutoModelForSequenceClassification,
             AutoTokenizer,BertConfig
         )
         from deepchem.models.torch_models.hf_models import HuggingFaceModel
+
+        # self.tokenizer = AutoTokenizer.from_pretrained(
+        #     model_name,
+        #     trust_remote_code=True,
+        # )
+        # config = BertConfig.from_pretrained(
+        #     model_name,
+        #     trust_remote_code=True,
+        # )
+
+        # _patch_dnabert2_cache(model_name)
+
+        # Force bert_layers.py into the HuggingFace modules cache BEFORE patching.
+        # AutoTokenizer alone does not reliably trigger the custom-code download
+        # on all platforms (Kaggle, Colab, Windows). AutoConfig with
+        # trust_remote_code=True guarantees bert_layers.py is written to disk
+        # so _patch_dnabert2_cache() can find and fix it.
+        _ = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+        del _ # Putting it in cache the model and then removing other parts
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
