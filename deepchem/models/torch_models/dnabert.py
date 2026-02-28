@@ -254,7 +254,7 @@ class DNABERT2(object):
         # )
 
         # _patch_dnabert2_cache(model_name)
-        _ = AutoConfig.from_pretrained(
+        _ = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
         )
