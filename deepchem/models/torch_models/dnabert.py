@@ -254,18 +254,12 @@ class DNABERT2(object):
         # )
 
         # _patch_dnabert2_cache(model_name)
-
-        # Force bert_layers.py into the HuggingFace modules cache BEFORE patching.
-        # AutoTokenizer alone does not reliably trigger the custom-code download
-        # on all platforms (Kaggle, Colab, Windows). AutoConfig with
-        # trust_remote_code=True guarantees bert_layers.py is written to disk
-        # so _patch_dnabert2_cache() can find and fix it.
         _ = AutoConfig.from_pretrained(
             model_name,
             trust_remote_code=True,
         )
         del _ # Putting it in cache the model and then removing other parts
-
+        import gc; gc.collect()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             trust_remote_code=True,
