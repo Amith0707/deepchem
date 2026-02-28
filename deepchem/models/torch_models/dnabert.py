@@ -257,6 +257,8 @@ class DNABERT2(object):
         _ = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
+            ignore_mismatched_sizes=True,
+            pad_token_id=0,
         )
         del _ # Putting it in cache the model and then removing other parts
         import gc; gc.collect()
