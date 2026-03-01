@@ -1,7 +1,8 @@
+import gc
 import glob
 import logging
 import os
-from typing import Any,Tuple
+from typing import Any, Tuple
 
 import numpy as np
 
@@ -88,9 +89,7 @@ def _patch_dnabert2_cache(
                 fh.write(src)
             logger.debug("DNABERT-2 ALiBi patch applied: %s", path)
         else:
-            logger.debug(
-                "DNABERT-2 ALiBi patch already applied: %s", path
-            )
+            logger.debug("DNABERT-2 ALiBi patch already applied: %s", path)
 
 
 class DNABERT2(object):
@@ -158,7 +157,7 @@ class DNABERT2(object):
 
     >>> import deepchem as dc
     >>> import numpy as np
-    >>> from deepchem.models.torch_models.dnabert2 import DNABERT2
+    >>> from deepchem.models.torch_models.dnabert import DNABERT2
 
     >>> sequences = ["ATGCGTACGTAGCTAGCTAGCTAGCGTA",
     ...              "GCTAGCTAGCTAGCTAGCTAGCTAGC"]
@@ -232,28 +231,32 @@ class DNABERT2(object):
                 f"Choose one of: {sorted(_SUPPORTED)}"
             )
 
-        self.task = task
         self.n_tasks = n_tasks
         self.model_name = model_name
 
         from transformers import (
-            AutoModel,AutoConfig,
+            AutoModel,
             AutoModelForMaskedLM,
             AutoModelForSequenceClassification,
-            AutoTokenizer,BertConfig
+            AutoTokenizer,
+            BertConfig,
         )
         from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
+        # Pull bert_layers.py into the HF modules cache before patching.
+        # AutoModel is the only call that reliably triggers the download of
+        # bert_layers.py on all platforms (Kaggle, Colab, local).
+        # The model init may fail due to missing pad_token_id in the raw
+        # config — that's expected and safe to swallow since we only need
+        # the file on disk.
         try:
-            _ = AutoModel.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-            )
+            _ = AutoModel.from_pretrained(model_name, trust_remote_code=True)
             del _
         except Exception:
-            pass  # Download succeeded even if model init fails; patch will find the file.
-        import gc; gc.collect()
-        self.tokenizer = AutoTokenizer.from_pretrained(
+            pass
+        gc.collect()
+
+        tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             trust_remote_code=True,
         )
@@ -263,8 +266,9 @@ class DNABERT2(object):
         )
 
         _patch_dnabert2_cache(model_name)
+
         config.attention_probs_dropout_prob = attention_probs_dropout_prob
-        config.pad_token_id = self.tokenizer.pad_token_id
+        config.pad_token_id = tokenizer.pad_token_id
         config.is_decoder = False
 
         if task == "classification":
@@ -291,25 +295,32 @@ class DNABERT2(object):
                 model_name, config=config, trust_remote_code=True
             )
 
-        self.model = model
+        super(DNABERT2, self).__init__(
+            model=model,
+            task=task,
+            tokenizer=tokenizer,
+            **kwargs,
+        )
 
-        if task != "feature_extractor":
-            self._hf_model = HuggingFaceModel(
-                model=model,
-                task=task,
-                tokenizer=self.tokenizer,
-                **kwargs,
-            )
-            self._hf_model._prepare_batch = self._prepare_batch
-            self.device = self._hf_model.device
-        else:
-            self._hf_model = HuggingFaceModel(
-                model=model,
-                task=task,
-                tokenizer=self.tokenizer,
-                **kwargs,
-            )
-            self.device = self._hf_model.device
+    def predict(self, dataset, **kwargs):
+        """Run inference.
+
+        Parameters
+        ----------
+        dataset : dc.data.Dataset
+            Dataset whose ``X`` contains DNA sequences as plain strings.
+
+        Returns
+        -------
+        np.ndarray
+            * ``classification`` — ``(N, num_labels)`` logits
+            * ``regression`` / ``mtr`` — ``(N, n_tasks)`` values
+            * ``mlm`` — ``(N, seq_len, vocab_size)`` logits
+            * ``feature_extractor`` — ``(N, 768)`` CLS-token embeddings
+        """
+        if self.task == "feature_extractor":
+            return self._predict_embeddings(dataset)
+        return super(DNABERT2, self).predict(dataset, **kwargs)
 
     def fit(self, dataset, nb_epoch: int = 1, **kwargs):
         """Train the model.
@@ -332,60 +343,8 @@ class DNABERT2(object):
                 "Use task='mlm' for pre-training or 'classification' / "
                 "'regression' for fine-tuning."
             )
-        return self._hf_model.fit(dataset, nb_epoch=nb_epoch, **kwargs)
+        return super(DNABERT2, self).fit(dataset, nb_epoch=nb_epoch, **kwargs)
 
-    def predict(self, dataset, **kwargs):
-        """Run inference.
-
-        Parameters
-        ----------
-        dataset : dc.data.Dataset
-            Dataset whose ``X`` contains DNA sequences as plain strings.
-
-        Returns
-        -------
-        np.ndarray
-            * ``classification`` — ``(N, num_labels)`` logits
-            * ``regression`` / ``mtr`` — ``(N, n_tasks)`` values
-            * ``mlm`` — ``(N, seq_len, vocab_size)`` logits
-            * ``feature_extractor`` — ``(N, 768)`` CLS-token embeddings
-        """
-        if self.task == "feature_extractor":
-            return self._predict_embeddings(dataset)
-        return self._hf_model.predict(dataset, **kwargs)
-
-    def evaluate(self, dataset, metrics, **kwargs):
-        """Evaluate the model on *dataset* using *metrics*.
-
-        Parameters
-        ----------
-        dataset : dc.data.Dataset
-            Evaluation dataset.
-        metrics : list[dc.metrics.Metric]
-            Metrics to compute.
-
-        Returns
-        -------
-        dict
-            Mapping from metric name to score.
-        """
-        return self._hf_model.evaluate(dataset, metrics, **kwargs)
-
-    def save_checkpoint(self, **kwargs):
-        """Save model checkpoint."""
-        return self._hf_model.save_checkpoint(**kwargs)
-
-    def load_from_pretrained(self, model_dir: str, **kwargs):
-        """Load weights from a previously saved checkpoint.
-
-        Parameters
-        ----------
-        model_dir : str
-            Directory produced by :meth:`save_checkpoint`.
-        """
-        return self._hf_model.load_from_pretrained(model_dir, **kwargs)
-
-    # Private helpers 
     def _predict_embeddings(self, dataset) -> np.ndarray:
         """Return CLS-token embeddings for every sequence in *dataset*.
 
@@ -413,7 +372,6 @@ class DNABERT2(object):
                 )
                 tokens = {k: v.to(self.device) for k, v in tokens.items()}
                 outputs = self.model(**tokens)
-                # outputs[0] → last_hidden_state (1, seq_len, hidden_size)
                 cls_vec = outputs[0][:, 0, :]
                 embeddings.append(cls_vec.cpu().numpy())
 
@@ -450,12 +408,9 @@ class DNABERT2(object):
             return_tensors="pt",
         )
 
-        #  MLM
         if self.task == "mlm":
-            input_ids, labels = (
-                self._hf_model.data_collator.torch_mask_tokens(
-                    tokens["input_ids"]
-                )
+            input_ids, labels = self.data_collator.torch_mask_tokens(
+                tokens["input_ids"]
             )
             inputs = {
                 "input_ids": input_ids.to(self.device),
@@ -464,20 +419,14 @@ class DNABERT2(object):
             }
             return inputs, None, w
 
-        # All other tasks 
         inputs = {k: v.to(self.device) for k, v in tokens.items()}
 
         if y is not None:
             y_tensor = torch.from_numpy(np.asarray(y))
-
             if self.task == "classification" and self.n_tasks == 1:
-                # CrossEntropyLoss expects Long
                 y_tensor = y_tensor.view(-1).long().to(self.device)
             else:
-                # MSELoss / BCEWithLogitsLoss expect Float
-                # covers: regression, mtr, multi-label classification
                 y_tensor = y_tensor.float().to(self.device)
-
             inputs["labels"] = y_tensor
         else:
             y_tensor = None

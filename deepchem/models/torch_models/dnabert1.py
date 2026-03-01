@@ -1,832 +1,472 @@
-# import numpy as np
-# import torch
+# import gc
+# import glob
+# import logging
+# import os
 # from typing import Any, Tuple
 
-# from transformers import (
-#     AutoConfig,
-#     AutoTokenizer,
-#     AutoModelForSequenceClassification,
-#     AutoModelForMaskedLM,
-#     BertConfig
-# )
+# import numpy as np
 
-# from deepchem.models.torch_models.hf_models import HuggingFaceModel
+# logger = logging.getLogger(__name__)
+
+# try:
+#     import torch
+#     has_torch = True
+# except ImportError:
+#     has_torch = False
+
+# try:
+#     from huggingface_hub import constants as hf_constants
+#     has_huggingface_hub = True
+# except ImportError:
+#     has_huggingface_hub = False
+
+# try:
+#     import transformers
+#     has_transformers = True
+# except ImportError:
+#     has_transformers = False
 
 
-# class DNABERTModel(HuggingFaceModel):
+# def _patch_dnabert2_cache(
+#     model_name: str = "zhihan1996/DNABERT-2-117M"
+# ) -> None:
+#     """Apply minimal targeted patches to DNABERT-2's cached custom files.
+
+#     DNABERT-2 ships with two compatibility issues on modern environments:
+
+#     1. **ALiBi meta-device conflict**: ``BertEncoder.__init__`` calls
+#        ``rebuild_alibi_tensor`` with no ``device`` argument, causing a
+#        ``RuntimeError`` when HuggingFace's lazy loader initialises tensors
+#        on the ``meta`` device (PyTorch >= 2.0 / transformers >= 4.38).
+#        The fix passes ``device='cpu'`` — a parameter the authors already
+#        defined — so the tensor is built on CPU and moved to the correct
+#        device during the first forward pass via the authors' own device
+#        catch-up logic in ``BertEncoder.forward``.
+
+#     2. **Flash-Attention / Triton**: controlled externally via
+#        ``config.attention_probs_dropout_prob > 0`` so no file-level
+#        patch is needed.
+
+#     Both patches are idempotent — safe to run multiple times.
+
+#     Parameters
+#     ----------
+#     model_name : str
+#         HuggingFace model identifier. Used only for error messages.
+#     """
+#     if not has_huggingface_hub:
+#         raise ImportError(
+#             "huggingface_hub is required. "
+#             "Install with: pip install huggingface_hub"
+#         )
+
+#     modules_cache = os.path.join(
+#         hf_constants.HF_HOME, "modules", "transformers_modules"
+#     )
+#     pattern = os.path.join(modules_cache, "**", "bert_layers.py")
+#     matches = glob.glob(pattern, recursive=True)
+
+#     if not matches:
+#         raise FileNotFoundError(
+#             f"bert_layers.py not found in HuggingFace modules cache at "
+#             f"'{modules_cache}'. Ensure the tokenizer has been downloaded "
+#             f"first via AutoTokenizer.from_pretrained('{model_name}', "
+#             f"trust_remote_code=True)."
+#         )
+
+#     _OLD = "self.rebuild_alibi_tensor(size=config.alibi_starting_size)"
+#     _NEW = (
+#         "self.rebuild_alibi_tensor("
+#         "size=config.alibi_starting_size, device='cpu')"
+#     )
+
+#     for path in matches:
+#         with open(path, "r") as fh:
+#             src = fh.read()
+#         if _OLD in src:
+#             src = src.replace(_OLD, _NEW)
+#             with open(path, "w") as fh:
+#                 fh.write(src)
+#             logger.debug("DNABERT-2 ALiBi patch applied: %s", path)
+#         else:
+#             logger.debug("DNABERT-2 ALiBi patch already applied: %s", path)
+
+
+# class DNABERT2(object):
+#     """DNABERT-2 Model for DNA sequence analysis.
+
+#     DNABERT-2 is a foundation model for DNA sequences based on the
+#     MosaicBERT architecture with Byte-Pair Encoding (BPE) tokenization.
+#     It replaces the k-mer tokenisation used in the original DNABERT with
+#     a data-driven BPE vocabulary that generalises across species and
+#     sequence types.
+
+#     This wrapper integrates DNABERT-2 into DeepChem and resolves several
+#     environment-specific compatibility issues transparently:
+
+#     * **Flash-Attention / Triton**: disabled via the authors' own
+#       documented ``attention_probs_dropout_prob`` config flag so no
+#       Triton installation is required and the model runs on both CPU
+#       and GPU.
+#     * **ALiBi meta-device conflict**: patched by supplying the ``device``
+#       argument the authors already defined but never passed at init.
+#     * **Environment-agnostic caching**: uses
+#       ``huggingface_hub.constants.HF_HOME`` rather than hard-coded
+#       paths, so the wrapper works on Kaggle, Colab, and local machines.
+
+#     The model supports five tasks:
+
+#     * ``mlm`` — masked language modelling (pre-training)
+#     * ``classification`` — binary or multi-class sequence classification
+#     * ``regression`` — single-target scalar regression
+#     * ``mtr`` — multi-task regression
+#     * ``feature_extractor`` — returns CLS-token embeddings
+
+#     Parameters
+#     ----------
+#     task : str
+#         Learning task. One of ``'mlm'``, ``'classification'``,
+#         ``'regression'``, ``'mtr'``, or ``'feature_extractor'``.
+#     model_name : str, optional
+#         HuggingFace model identifier.
+#         Defaults to ``'zhihan1996/DNABERT-2-117M'``.
+#     n_tasks : int, optional
+#         Number of prediction targets. Used for ``'classification'``,
+#         ``'regression'``, and ``'mtr'``. Defaults to ``1``.
+#     attention_probs_dropout_prob : float, optional
+#         Any value ``> 0`` disables the Triton Flash-Attention kernel
+#         and uses a pure-PyTorch attention implementation instead.
+#         This is the authors' own documented mechanism — see
+#         ``configuration_bert.py`` in the model repo. Defaults to
+#         ``0.1``.
+#     **kwargs
+#         Additional keyword arguments forwarded to
+#         :class:`~deepchem.models.torch_models.hf_models.HuggingFaceModel`.
+
+#     Raises
+#     ------
+#     ImportError
+#         If ``torch``, ``transformers``, or ``huggingface_hub`` are not
+#         installed.
+#     ValueError
+#         If an unsupported ``task`` string is provided.
+
+#     Examples
+#     --------
+#     **Binary classification — promoter detection**
+
+#     >>> import deepchem as dc
+#     >>> import numpy as np
+#     >>> from deepchem.models.torch_models.dnabert2 import DNABERT2
+
+#     >>> sequences = ["ATGCGTACGTAGCTAGCTAGCTAGCGTA",
+#     ...              "GCTAGCTAGCTAGCTAGCTAGCTAGC"]
+#     >>> labels = np.array([1, 0])
+#     >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
+
+#     >>> model = DNABERT2(task='classification', n_tasks=1)
+#     >>> loss = model.fit(dataset, nb_epoch=1)
+
+#     **Regression**
+
+#     >>> labels = np.array([0.82, 0.31])
+#     >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
+#     >>> model = DNABERT2(task='regression', n_tasks=1)
+#     >>> loss = model.fit(dataset, nb_epoch=1)
+
+#     **Multi-task regression**
+
+#     >>> labels = np.array([[0.82, 0.5], [0.31, 0.7]])
+#     >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
+#     >>> model = DNABERT2(task='mtr', n_tasks=2)
+#     >>> loss = model.fit(dataset, nb_epoch=1)
+
+#     **Feature extraction**
+
+#     >>> model = DNABERT2(task='feature_extractor')
+#     >>> embeddings = model.predict(dataset)  # shape (N, 768)
+
+#     **Masked language modelling**
+
+#     >>> model = DNABERT2(task='mlm')
+#     >>> loss = model.fit(dataset, nb_epoch=1)
+
+#     References
+#     ----------
+#     .. Zhou, Z., Ji, Y., Li, W., Dutta, P., Davuluri, R., & Liu, H.
+#        (2023). DNABERT-2: Efficient Foundation Model and Benchmark For
+#        Multi-Species Genome. arXiv:2306.15006.
+#     """
+
 #     def __init__(
 #         self,
 #         task: str,
 #         model_name: str = "zhihan1996/DNABERT-2-117M",
 #         n_tasks: int = 1,
+#         attention_probs_dropout_prob: float = 0.1,
 #         **kwargs,
 #     ):
-#         self.n_tasks = n_tasks
-
-#         tokenizer = AutoTokenizer.from_pretrained(
-#             model_name,
-#             trust_remote_code=True
-#         )
-
-#         config = AutoConfig.from_pretrained(
-#             model_name,
-#             trust_remote_code=True
-#         )
-
-#         if task == "classification":
-#             config.num_labels = 2 if n_tasks == 1 else n_tasks
-#         elif task == "regression":
-#             config.num_labels = n_tasks
-#             config.problem_type = "regression"
-
-#         if task == "mlm":
-#             model = AutoModelForMaskedLM.from_pretrained(
-#                 model_name,
-#                 config=config,
-#                 trust_remote_code=True
+#         if not has_torch:
+#             raise ImportError(
+#                 "PyTorch is required. Install: pip install torch"
 #             )
-#         else:
-#             model = AutoModelForSequenceClassification.from_pretrained(
-#                 model_name,
-#                 config=config,
-#                 trust_remote_code=True
+#         if not has_transformers:
+#             raise ImportError(
+#                 "transformers is required. "
+#                 "Install: pip install 'transformers>=4.29,<5'"
+#             )
+#         if not has_huggingface_hub:
+#             raise ImportError(
+#                 "huggingface_hub is required. "
+#                 "Install: pip install huggingface_hub"
 #             )
 
-#         super().__init__(
-#             model=model,
-#             task=task,
-#             tokenizer=tokenizer,
-#             **kwargs,
-#         )
-
-#     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-#         X, y, w = batch
-
-#         X_flat = np.array(X).ravel().tolist()
-
-#         tokens = self.tokenizer(
-#             X_flat,
-#             padding=True,
-#             truncation=True,
-#             max_length=512,
-#             return_tensors="pt",
-#         )
-
-#         inputs = {k: v.to(self.device) for k, v in tokens.items()}
-
-#         y_tensor = None
-#         if y is not None:
-#             y_tensor = torch.from_numpy(np.asarray(y)).to(self.device)
-
-#             if self.task == "classification" and self.n_tasks == 1:
-#                 y_tensor = y_tensor.view(-1).long()
-#             else:
-#                 y_tensor = y_tensor.float()
-
-#             inputs["labels"] = y_tensor
-
-#         return inputs, y_tensor, w
-
-
-# import importlib
-# import numpy as np
-# import torch
-# from typing import Any, Tuple
-
-# from transformers import AutoConfig, AutoTokenizer
-# from deepchem.models.torch_models.hf_models import HuggingFaceModel
-
-
-# class DNABERTModel(HuggingFaceModel):
-#     def __init__(
-#         self,
-#         task: str,
-#         model_name: str = "zhihan1996/DNABERT-2-117M",
-#         n_tasks: int = 1,
-#         **kwargs,
-#     ):
-#         self.n_tasks = n_tasks
-
-#         tokenizer = AutoTokenizer.from_pretrained(
-#             model_name, trust_remote_code=True
-#         )
-
-#         config = AutoConfig.from_pretrained(
-#             model_name, trust_remote_code=True
-#         )
-
-#         if task == "mlm":
-#             class_key = "AutoModelForMaskedLM"
-#         else:
-#             class_key = "AutoModelForSequenceClassification"
-
-#         if class_key not in config.auto_map:
+#         _SUPPORTED = {
+#             "mlm", "classification", "regression", "mtr",
+#             "feature_extractor"
+#         }
+#         if task not in _SUPPORTED:
 #             raise ValueError(
-#                 f"{class_key} not found in config.auto_map."
+#                 f"Unsupported task '{task}'. "
+#                 f"Choose one of: {sorted(_SUPPORTED)}"
 #             )
 
-#         mapping = config.auto_map[class_key]
-#         _, class_path = mapping.split("--")
-#         module_name, class_name = class_path.rsplit(".", 1)
+#         self.task = task
+#         self.n_tasks = n_tasks
+#         self.model_name = model_name
 
-#         base_module = config.__class__.__module__.rsplit(".", 1)[0]
-#         full_module_path = f"{base_module}.{module_name}"
+#         from transformers import (
+#             AutoModel,
+#             AutoModelForMaskedLM,
+#             AutoModelForSequenceClassification,
+#             AutoTokenizer,
+#             BertConfig,
+#         )
+#         from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
-#         module = importlib.import_module(full_module_path)
-#         model_class = getattr(module, class_name)
+#         # Pull bert_layers.py into the HF modules cache before patching.
+#         # AutoModel is the only call that reliably triggers the download of
+#         # bert_layers.py on all platforms (Kaggle, Colab, local).
+#         # The model init may fail due to missing pad_token_id in the raw
+#         # config — that's expected and safe to swallow since we only need
+#         # the file on disk.
+#         try:
+#             _ = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+#             del _
+#         except Exception:
+#             pass
+#         gc.collect()
 
-#         if task == "classification":
-#             config.num_labels = 2 if n_tasks == 1 else n_tasks
-#         elif task == "regression":
-#             config.num_labels = n_tasks
-#             config.problem_type = "regression"
-
-#         model = model_class.from_pretrained(
+#         self.tokenizer = AutoTokenizer.from_pretrained(
 #             model_name,
-#             config=config,
+#             trust_remote_code=True,
+#         )
+#         config = BertConfig.from_pretrained(
+#             model_name,
 #             trust_remote_code=True,
 #         )
 
-#         super(DNABERTModel, self).__init__(
+#         _patch_dnabert2_cache(model_name)
+
+#         config.attention_probs_dropout_prob = attention_probs_dropout_prob
+#         config.pad_token_id = self.tokenizer.pad_token_id
+#         config.is_decoder = False
+
+#         if task == "classification":
+#             config.num_labels = 2 if n_tasks == 1 else n_tasks
+#             config.problem_type = (
+#                 "single_label_classification"
+#                 if n_tasks == 1
+#                 else "multi_label_classification"
+#             )
+#         elif task in ("regression", "mtr"):
+#             config.num_labels = n_tasks
+#             config.problem_type = "regression"
+
+#         if task == "mlm":
+#             model = AutoModelForMaskedLM.from_pretrained(
+#                 model_name, config=config, trust_remote_code=True
+#             )
+#         elif task == "feature_extractor":
+#             model = AutoModel.from_pretrained(
+#                 model_name, config=config, trust_remote_code=True
+#             )
+#         else:
+#             model = AutoModelForSequenceClassification.from_pretrained(
+#                 model_name, config=config, trust_remote_code=True
+#             )
+
+#         self.model = model
+#         self._hf_model = HuggingFaceModel(
 #             model=model,
 #             task=task,
-#             tokenizer=tokenizer,
+#             tokenizer=self.tokenizer,
 #             **kwargs,
 #         )
+#         if task != "feature_extractor":
+#             self._hf_model._prepare_batch = self._prepare_batch
+#         self.device = self._hf_model.device
+
+#     def fit(self, dataset, nb_epoch: int = 1, **kwargs):
+#         """Train the model.
+
+#         Parameters
+#         ----------
+#         dataset : dc.data.Dataset
+#             Dataset whose ``X`` contains DNA sequences as plain strings.
+#         nb_epoch : int, optional
+#             Number of training epochs. Defaults to ``1``.
+
+#         Returns
+#         -------
+#         float
+#             Mean training loss over the last epoch.
+#         """
+#         if self.task == "feature_extractor":
+#             raise ValueError(
+#                 "fit() is not supported for task='feature_extractor'. "
+#                 "Use task='mlm' for pre-training or 'classification' / "
+#                 "'regression' for fine-tuning."
+#             )
+#         return self._hf_model.fit(dataset, nb_epoch=nb_epoch, **kwargs)
+
+#     def predict(self, dataset, **kwargs):
+#         """Run inference.
+
+#         Parameters
+#         ----------
+#         dataset : dc.data.Dataset
+#             Dataset whose ``X`` contains DNA sequences as plain strings.
+
+#         Returns
+#         -------
+#         np.ndarray
+#             * ``classification`` — ``(N, num_labels)`` logits
+#             * ``regression`` / ``mtr`` — ``(N, n_tasks)`` values
+#             * ``mlm`` — ``(N, seq_len, vocab_size)`` logits
+#             * ``feature_extractor`` — ``(N, 768)`` CLS-token embeddings
+#         """
+#         if self.task == "feature_extractor":
+#             return self._predict_embeddings(dataset)
+#         return self._hf_model.predict(dataset, **kwargs)
+
+#     def evaluate(self, dataset, metrics, **kwargs):
+#         """Evaluate the model on *dataset* using ``metrics``.
+
+#         Parameters
+#         ----------
+#         dataset : dc.data.Dataset
+#             Evaluation dataset.
+#         metrics : list[dc.metrics.Metric]
+#             Metrics to compute.
+
+#         Returns
+#         -------
+#         dict
+#             Mapping from metric name to score.
+#         """
+#         return self._hf_model.evaluate(dataset, metrics, **kwargs)
+
+#     def save_checkpoint(self, **kwargs):
+#         """Save model checkpoint."""
+#         return self._hf_model.save_checkpoint(**kwargs)
+
+#     def load_from_pretrained(self, model_dir: str, **kwargs):
+#         """Load weights from a previously saved checkpoint.
+
+#         Parameters
+#         ----------
+#         model_dir : str
+#             Directory produced by :meth:`save_checkpoint`.
+#         """
+#         return self._hf_model.load_from_pretrained(model_dir, **kwargs)
+
+#     def _predict_embeddings(self, dataset) -> np.ndarray:
+#         """Return CLS-token embeddings for every sequence in *dataset*.
+
+#         Parameters
+#         ----------
+#         dataset : dc.data.Dataset
+#             Dataset whose ``X`` contains DNA sequences as plain strings.
+
+#         Returns
+#         -------
+#         np.ndarray, shape (N, hidden_size)
+#             One CLS-token vector per input sequence.
+#         """
+#         self.model.eval()
+#         embeddings = []
+
+#         with torch.no_grad():
+#             for seq in dataset.X:
+#                 tokens = self.tokenizer(
+#                     seq,
+#                     return_tensors="pt",
+#                     truncation=True,
+#                     max_length=512,
+#                     padding=True,
+#                 )
+#                 tokens = {k: v.to(self.device) for k, v in tokens.items()}
+#                 outputs = self.model(**tokens)
+#                 cls_vec = outputs[0][:, 0, :]
+#                 embeddings.append(cls_vec.cpu().numpy())
+
+#         return np.vstack(embeddings)
 
 #     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-#         X, y, w = batch
+#         """Prepare a batch for the model.
 
-#         X_flat = np.array(X).ravel().tolist()
+#         Handles:
+
+#         * DNA sequences stored as raw strings in ``X``
+#         * Correct label dtype per task — ``long`` for single-label
+#           classification, ``float`` for everything else
+#         * MLM dynamic masking via the tokenizer's data collator
+
+#         Parameters
+#         ----------
+#         batch : tuple
+#             ``(X, y, w)`` triple from a DeepChem DataLoader.
+
+#         Returns
+#         -------
+#         tuple
+#             ``(inputs_dict, y_tensor, w)`` ready for ``model.forward``.
+#         """
+#         X, y, w = batch
+#         sequences = np.array(X).ravel().tolist()
 
 #         tokens = self.tokenizer(
-#             X_flat,
+#             sequences,
 #             padding=True,
 #             truncation=True,
 #             max_length=512,
 #             return_tensors="pt",
 #         )
 
+#         if self.task == "mlm":
+#             input_ids, labels = (
+#                 self._hf_model.data_collator.torch_mask_tokens(
+#                     tokens["input_ids"]
+#                 )
+#             )
+#             inputs = {
+#                 "input_ids": input_ids.to(self.device),
+#                 "attention_mask": tokens["attention_mask"].to(self.device),
+#                 "labels": labels.to(self.device),
+#             }
+#             return inputs, None, w
+
 #         inputs = {k: v.to(self.device) for k, v in tokens.items()}
 
-#         y_tensor = None
-
 #         if y is not None:
-#             y_tensor = torch.from_numpy(np.asarray(y)).to(self.device)
-
+#             y_tensor = torch.from_numpy(np.asarray(y))
 #             if self.task == "classification" and self.n_tasks == 1:
-#                 y_tensor = y_tensor.view(-1).long()
+#                 y_tensor = y_tensor.view(-1).long().to(self.device)
 #             else:
-#                 y_tensor = y_tensor.float()
-
+#                 y_tensor = y_tensor.float().to(self.device)
 #             inputs["labels"] = y_tensor
+#         else:
+#             y_tensor = None
 
 #         return inputs, y_tensor, w
-
-from typing import Dict, Any, Tuple, Optional
-import torch
-import numpy as np
-import torch.nn as nn
-from deepchem.models.torch_models.hf_models import HuggingFaceModel
-from transformers import (AutoModelForMaskedLM, AutoTokenizer, 
-                          DataCollatorForLanguageModeling, BertConfig)
-
-class DNABERTModel(HuggingFaceModel):
-    """DNABERT Model for DNA Sequenece analysis.
-    
-    DNABERT is a transformer-based model pretrained on genomic sequences.
-    It can be used for both pretraining embeddings and fine tuning for downstream genomic applications
-    such as promoter, sequence classification, splice site detection and sequenec rgeression. 
-    
-    The model supports multiple task types:
-    -  `mlm`- Masked Language Modeling for pretraining.
-    -  `regression`- Single or multi-task regression.
-    -  `classification`- Single or multi-label classification.
-    
-    Parameters
-    -----------
-    task: str
-        The learning task type. Supported tasks:
-        - `mlm`- masked language modeling.
-        -  `regression`- Regression Tasks (e.g- Binding Affinity Prediction)
-        -  `classification`- Classification Tasks(e.g Promoter Detection)
-
-    model_name: str, optional(default "zhihan1996/DNABERT-2-117M")
-        Hugging Face model identifier or local path
-    
-    n_tasks: int, default 1
-        Number of prediction targets for a multitask learning model
-
-    config : Dict[Any, Any], optional (default {})
-        Additional configuration parameters for the model
-
-    Example
-    --------
-    ### Need to fill- when testing is done
-
-    Notes
-    --------
-    - DNABERT-2 uses k-mer tokenization optimized for DNA Sequences.
-    - The model expects uppercase DNA Sequences (A,C,G,T).
-    - For best results, sequences should be between 50-512 base pairs.
-
-    References
-    ----------
-    .. [1] Zhou, Z., et al. "DNABERT-2: Efficient Foundation Model for 
-       Multi-Species Genome." arXiv preprint arXiv:2306.15006 (2023).
-    """
-
-    def __init__(
-            self,
-            task: str,
-            model_name: str = 'zhihan1996/DNABERT-2-117M',
-            n_tasks: int = 1,
-            config: Dict[Any, Any] = {},
-            **kwargs
-    ):
-        self.n_tasks = n_tasks
-        self.model_name = model_name
-        self.task = task
-        
-        model_config = BertConfig.from_pretrained(model_name, **config)
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
-        )
-
-        base_model = AutoModelForMaskedLM.from_pretrained(
-            model_name, config=model_config, trust_remote_code=True
-        )
-
-        if task in ['classification', 'regression']:
-            hidden_size = model_config.hidden_size
-            out_features = 2 if (task == 'classification' and n_tasks == 1) else n_tasks
-            base_model.classifier = nn.Linear(hidden_size, out_features)
-            
-        super(DNABERTModel, self).__init__(
-            model=base_model,
-            task=task,
-            tokenizer=tokenizer,
-            **kwargs
-        )
-        
-        if task == 'mlm':
-            self.data_collator = DataCollatorForLanguageModeling(
-                tokenizer=tokenizer, mlm=True, mlm_probability=0.15
-            )
-
-    def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-        """Prepares a batch of DNA sequences for the model.
-
-        Handles different label formats based on task type:
-        - Classification (single-task): uses long int for CrossEntropyLoss
-        - Classification (multi-task): uses float for BCEWithLogitsLoss
-        - Regression: uses float
-        - MLM: masks tokens for pretraining
-        """
-        sequences_batch, y, w = batch
-        
-        if isinstance(sequences_batch, np.ndarray):
-            sequences_flat = sequences_batch.flatten()
-            sequences_list = [str(s) for s in sequences_flat]
-        elif isinstance(sequences_batch, (list, tuple)):
-            sequences_list = [str(s) for s in sequences_batch]
-        else:
-            sequences_list = [str(sequences_batch)]
-        
-        tokens = self.tokenizer(
-            sequences_list,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        )
-
-        if self.task == 'mlm':
-            inputs, labels = self.data_collator.torch_mask_tokens(tokens['input_ids'])
-            tokens_device = {k: v.to(self.device) for k, v in tokens.items()}
-            inputs_dict = {
-                'input_ids': inputs.to(self.device), 
-                'labels': labels.to(self.device),
-                'attention_mask': tokens_device['attention_mask']
-            }
-            return inputs_dict, None, w
-        
-        tokens_device = {k: v.to(self.device) for k, v in tokens.items()}
-        
-        y_tensor = None
-        if y is not None:
-            if isinstance(y, np.ndarray):
-                y_flat = y.flatten()
-            else:
-                y_flat = np.array(y).flatten()
-            
-            y_tensor = torch.from_numpy(y_flat).to(self.device)
-            
-            if self.task == 'classification' and self.n_tasks == 1:
-                y_tensor = y_tensor.long().squeeze()
-            else:
-                y_tensor = y_tensor.float()
-                if y_tensor.dim() == 1 and self.n_tasks > 1:
-                    y_tensor = y_tensor.unsqueeze(1)
-        
-        tokens_device['labels'] = y_tensor
-        return tokens_device, y_tensor, w
-    
-    def _compute_model_loss(self, inputs, labels):
-        outputs = self.model.bert(**{k: v for k, v in inputs.items() if k != 'labels'})
-        
-        if isinstance(outputs, tuple):
-            last_hidden_state = outputs[0]
-        else:
-            last_hidden_state = outputs.last_hidden_state
-        
-        pooled_output = last_hidden_state[:, 0, :]
-        logits = self.model.classifier(pooled_output)
-        
-        if labels is not None:
-            if self.task == 'classification' and self.n_tasks == 1:
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits, labels)
-            elif self.task == 'classification':
-                loss_fct = nn.BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
-            else:
-                loss_fct = nn.MSELoss()
-                loss = loss_fct(logits.squeeze(), labels)
-            return loss, logits
-        return None, logits
-    
-    def _predict(self, generator, transformers, uncertainty, other_output_types):
-        results = []
-        for batch in generator:
-            inputs, labels, weights = self._prepare_batch(batch)
-            
-            with torch.no_grad():
-                _, logits = self._compute_model_loss(inputs, labels)
-                
-                if self.task == 'classification':
-                    if self.n_tasks == 1:
-                        probs = torch.softmax(logits, dim=1)
-                        predictions = probs[:, 1].cpu().numpy()
-                    else:
-                        predictions = torch.sigmoid(logits).cpu().numpy()
-                else:
-                    predictions = logits.squeeze().cpu().numpy()
-                
-                results.append(predictions)
-        
-        results = np.concatenate(results)
-        return results
-
-
-# Gemini
-# from typing import Dict, Any, Tuple, Optional
-# import torch
-# import numpy as np
-# import torch.nn as nn
-# from deepchem.models.torch_models.hf_models import HuggingFaceModel
-# from transformers import (AutoModelForMaskedLM, AutoTokenizer, 
-#                           DataCollatorForLanguageModeling, BertConfig)
-
-# class DNABERTModel(HuggingFaceModel):
-#     def __init__(
-#             self,
-#             task: str,
-#             model_name: str = 'zhihan1996/DNABERT-2-117M',
-#             n_tasks: int = 1,
-#             config: Dict[Any, Any] = {},
-#             **kwargs
-#     ):
-#         self.n_tasks = n_tasks
-#         self.model_name = model_name
-        
-#         # 1. FIX: Load the NATIVE BertConfig to avoid the ValueError mismatch
-#         model_config = BertConfig.from_pretrained(model_name, **config)
-        
-#         # 2. Load Tokenizer (BPE for DNABERT-2)
-#         tokenizer = AutoTokenizer.from_pretrained(
-#             model_name, trust_remote_code=True
-#         )
-
-#         # 3. Load the Backbone Model
-#         # We load MaskedLM because DNABERT-2 is natively a Masked LM
-#         # We will add our own head in the _prepare_batch or via a wrapper
-#         base_model = AutoModelForMaskedLM.from_pretrained(
-#             model_name, config=model_config, trust_remote_code=True
-#         )
-
-#         # Attach a classification/regression head if needed
-#         if task in ['classification', 'regression']:
-#             hidden_size = model_config.hidden_size
-#             out_features = 2 if (task == 'classification' and n_tasks == 1) else n_tasks
-#             # Attach it directly to the base_model object
-#             base_model.classifier = nn.Linear(hidden_size, out_features)
-            
-#         super(DNABERTModel, self).__init__(
-#             model=base_model,
-#             task=task,
-#             tokenizer=tokenizer,
-#             **kwargs
-#         )
-        
-#         if task == 'mlm':
-#             self.data_collator = DataCollatorForLanguageModeling(
-#                 tokenizer=tokenizer, mlm=True, mlm_probability=0.15
-#             )
-
-#     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-#         sequences_batch, y, w = batch
-        
-#         # Standardize input to list of strings
-#         if isinstance(sequences_batch, np.ndarray):
-#             sequences_list = sequences_batch.ravel().tolist()
-#         else:
-#             sequences_list = list(sequences_batch)
-        
-#         tokens = self.tokenizer(
-#             sequences_list,
-#             padding=True,
-#             truncation=True,
-#             max_length=512,
-#             return_tensors="pt"
-#         ).to(self.device)
-
-#         if self.task == 'mlm':
-#             inputs, labels = self.data_collator.torch_mask_tokens(tokens['input_ids'])
-#             return {'input_ids': inputs.to(self.device), 
-#                     'labels': labels.to(self.device),
-#                     'attention_mask': tokens['attention_mask']}, None, w
-        
-#         # --- Classification/Regression Logic ---
-#         # 1. Get backbone outputs (using .bert to skip the original MLM head)
-#         outputs = self.model.bert(**tokens)
-        
-#         # 2. Pooling: Use the [CLS] token (first token)
-#         pooled_output = outputs.last_hidden_state[:, 0, :]
-        
-#         # 3. Head: Pass through our custom linear layer
-#         logits = self.model.classifier(pooled_output)
-        
-#         loss = None
-#         y_tensor = None
-#         if y is not None:
-#             y_tensor = torch.from_numpy(np.asarray(y)).to(self.device)
-#             if self.task == 'classification' and self.n_tasks == 1:
-#                 y_tensor = y_tensor.view(-1).long()
-#                 loss_fct = nn.CrossEntropyLoss()
-#                 loss = loss_fct(logits, y_tensor)
-#             else:
-#                 y_tensor = y_tensor.float()
-#                 loss_fct = nn.MSELoss() if self.task == 'regression' else nn.BCEWithLogitsLoss()
-#                 loss = loss_fct(logits, y_tensor)
-
-#         # Return dict for the model, plus labels and weights
-#         return {'logits': logits, 'loss': loss}, y_tensor, w
-
-
-# GPT
-# from typing import Dict,Any,Tuple
-# from deepchem.models.torch_models.hf_models import HuggingFaceModel
-# from transformers import (AutoConfig,AutoModelForMaskedLM,AutoTokenizer,DataCollatorForLanguageModeling,AutoModelForSequenceClassification)
-# from transformers.modeling_utils import PreTrainedModel
-
-# try:
-#     import torch
-#     import numpy as np
-#     has_torch=True
-# except:
-#     has_torch=False
-
-# class DNABERTModel(HuggingFaceModel):
-#     """DNABERT Model for DNA Sequenece analysis.
-    
-#     DNABERT is a transformer-based model pretrained on genomic sequences.
-#     It can be used for both pretraining embeddings and fine tuning for downstream genomic applications
-#     such as promoter, sequence classification, splice site detection and sequenec rgeression. 
-    
-#     The model supports multiple task types:
-#     -  `mlm`- Masked Language Modeling for pretraining.
-#     -  `regression`- Single or multi-task regression.
-#     -  `classification`- Single or multi-label classification.
-    
-#     Parameters
-#     -----------
-#     task: str
-#         The learning task type. Supported tasks:
-#         - `mlm`- masked language modeling.
-#         -  `regression`- Regression Tasks (e.g- Binding Affinity Prediction)
-#         -  `classification`- Classification Tasks(e.g Promoter Detection)           # Reminder- Test all these
-
-#     model_name: str, optional(default "zhihan1996/DNABERT-2-117M")
-#         Hugging Face model identifier or local path
-    
-#     n_tasks: int, default 1
-#         Number of prediction targets for a multitask learning model
-
-#     config : Dict[Any, Any], optional (default {})
-#         Additional configuration parameters for the model
-
-#     Example
-#     --------
-#     ### Need to fill- when testing is done
-
-#     Notes
-#     --------
-#     - DNABERT-2 uses k-mer tokenization optimized for DNA Sequences.
-#     - The model expects uppercase DNA Sequences (A,C,G,T).
-#     - For best results, sequences should be between 50-512 base pairs.
-
-#     References
-#     ----------
-#     .. [1] Zhou, Z., et al. "DNABERT-2: Efficient Foundation Model for 
-#        Multi-Species Genome." arXiv preprint arXiv:2306.15006 (2023).
-#     """
-
-#     def __init__(
-#             self,
-#             task:str,
-#             model_name:str='zhihan1996/DNABERT-2-117M',
-#             n_tasks:int=1,
-#             config:Dict[Any,Any]={},
-#             **kwargs
-#     ):
-#         self.n_tasks=n_tasks
-#         self.model_name=model_name
-#         tokenizer=AutoTokenizer.from_pretrained(
-#             model_name,trust_remote_code=True
-#         )
-        
-#         model:PreTrainedModel
-#         if task == "mlm":
-#             model = AutoModelForMaskedLM.from_pretrained(
-#                 model_name,
-#                 trust_remote_code=True
-#             )
-
-#         elif task in ["classification", "regression"]:
-
-#             model_config = AutoConfig.from_pretrained(
-#                 model_name,
-#                 trust_remote_code=True
-#             )
-
-#             if task == "classification":
-#                 if n_tasks == 1:
-#                     model_config.problem_type = "single_label_classification"
-#                     model_config.num_labels = 2
-#                 else:
-#                     model_config.problem_type = "multi_label_classification"
-#                     model_config.num_labels = n_tasks
-
-#             elif task == "regression":
-#                 model_config.problem_type = "regression"
-#                 model_config.num_labels = n_tasks
-
-#             model = AutoModelForSequenceClassification.from_pretrained(
-#                 model_name,
-#                 config=model_config,
-#                 trust_remote_code=True
-#             )
-
-#         else:
-#             raise ValueError("Invalid task")
-
-        
-#         super(DNABERTModel,self).__init__(
-#             model=model,
-#             task=task,
-#             tokenizer=tokenizer,
-#             **kwargs
-#         )
-        
-#         if task=='mlm':
-#             self.data_collator=DataCollatorForLanguageModeling(
-#                 tokenizer=tokenizer,
-#                 mlm=True,
-#                 mlm_probability=0.15
-#             )
-    
-#     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-#         sequences_batch, y, w = batch
-
-#         # Convert numpy array to list
-#         if isinstance(sequences_batch, np.ndarray):
-#             sequences_list = sequences_batch.tolist()
-#         else:
-#             sequences_list = list(sequences_batch)
-
-#         tokens = self.tokenizer(
-#             sequences_list,
-#             padding=True,
-#             truncation=True,
-#             return_tensors="pt"
-#         )
-
-#         # Move tokens to device
-#         for key in tokens:
-#             tokens[key] = tokens[key].to(self.device)
-
-#         if self.task == "mlm":
-#             inputs, labels = self.data_collator.torch_mask_tokens(
-#                 tokens["input_ids"]
-#             )
-
-#             inputs = {
-#                 "input_ids": inputs.to(self.device),
-#                 "labels": labels.to(self.device),
-#                 "attention_mask": tokens["attention_mask"],
-#             }
-
-#             return inputs, None, w
-
-#         elif self.task in ["classification", "regression"]:
-
-#             if y is not None:
-#                 y_tensor = torch.from_numpy(y)
-
-#                 if self.task == "regression":
-#                     y_tensor = y_tensor.float()
-#                 elif self.task == "classification":
-#                     if self.n_tasks == 1:
-#                         y_tensor = y_tensor.long()
-#                     else:
-#                         y_tensor = y_tensor.float()
-
-#                 y_tensor = y_tensor.to(self.device)
-#                 tokens["labels"] = y_tensor
-
-#             return tokens, y, w
-
-
-# from typing import Dict,Any,Tuple
-# from deepchem.models.torch_models.hf_models import HuggingFaceModel
-# from transformers import (AutoConfig,AutoModelForMaskedLM,AutoModelForSequenceClassification,AutoTokenizer)
-# from transformers import DataCollatorForLanguageModeling # added this
-# from transformers.modeling_utils import PreTrainedModel
-
-# try:
-#     import torch
-#     import numpy as np # added    
-#     has_torch=True
-# except:
-#     has_torch=False
-
-# class DNABERTModel(HuggingFaceModel):
-#     """DNABERT Model for DNA Sequenece analysis.
-    
-#     DNABERT is a transformer-based model pretrained on genomic sequences.
-#     It can be used for both pretraining embeddings and fine tuning for downstream genomic applications
-#     such as promoter, sequence classification, splice site detection and sequenec rgeression. 
-    
-#     The model supports multiple task types:
-#     -  `mlm`- Masked Language Modeling for pretraining.
-#     -  `regression`- Single or multi-task regression.
-#     -  `classification`- Single or multi-label classification.
-    
-#     Parameters
-#     -----------
-#     task: str
-#         The learning task type. Supported tasks:
-#         - `mlm`- masked language modeling.
-#         -  `regression`- Regression Tasks (e.g- Binding Affinity Prediction)
-#         -  `classification`- Classification Tasks(e.g Promoter Detection)           # Reminder- Test all these
-
-#     model_name: str, optional(default "zhihan1996/DNABERT-2-117M")
-#         Hugging Face model identifier or local path
-    
-#     n_tasks: int, default 1
-#         Number of prediction targets for a multitask learning model
-
-#     config : Dict[Any, Any], optional (default {})
-#         Additional configuration parameters for the model
-
-#     Example
-#     --------
-#     ### Need to fill- when testing is done
-
-#     Notes
-#     --------
-#     - DNABERT-2 uses k-mer tokenization optimized for DNA Sequences.
-#     - The model expects uppercase DNA Sequences (A,C,G,T).
-#     - For best results, sequences should be between 50-512 base pairs.
-
-#     References
-#     ----------
-#     .. [1] Zhou, Z., et al. "DNABERT-2: Efficient Foundation Model for 
-#        Multi-Species Genome." arXiv preprint arXiv:2306.15006 (2023).
-#     """
-
-#     def __init__(
-#             self,
-#             task:str,
-#             model_name:str='zhihan1996/DNABERT-2-117M',
-#             n_tasks:int=1,
-#             config:Dict[Any,Any]={},
-#             **kwargs
-#     ):
-#         self.n_tasks=n_tasks
-#         self.model_name=model_name
-#         tokenizer=AutoTokenizer.from_pretrained(
-#             model_name,trust_remote_code=True
-#         )
-#         model_config=AutoConfig.from_pretrained(
-#             model_name,**config,trust_remote_code=True
-#         )
-#         model:PreTrainedModel
-#         if task=='mlm':
-#             model=AutoModelForMaskedLM.from_pretrained(
-#                 model_name,
-#                 config=model_config,
-#                 trust_remote_code=True
-#             )
-#         elif task=='regression':
-#             model_config.problem_type='regression'
-#             model_config.num_labels=n_tasks
-#             model=AutoModelForSequenceClassification.from_pretrained(
-#                 model_name,
-#                 config=model_config,
-#                 trust_remote_code=True
-#             )
-#         elif task=='classification':
-#             if n_tasks==1:
-#                 model_config.problem_type='single_label_classification'
-#                 model_config.num_labels=2
-#             else:
-#                 model_config.problem_type='multi_label_classification'
-#                 model_config.num_labels=n_tasks
-
-#             model=AutoModelForSequenceClassification.from_pretrained(
-#                 model_name,
-#                 config=model_config,
-#                 trust_remote_code=True
-#             )
-#         else:
-#             raise ValueError('invalid task specification')
-        
-#         super(DNABERTModel,self).__init__(
-#             model=model,
-#             task=task,
-#             tokenizer=tokenizer,
-#             **kwargs
-#         )
-#         # adding data collator here
-#         if task=='mlm':
-#             self.data_collator=DataCollatorForLanguageModeling(
-#                 tokenizer=tokenizer,
-#                 mlm=True,
-#                 mlm_probability=0.15
-#         )
-    
-#     def _prepare_batch(self, batch: Tuple[Any, Any, Any]):
-#         """Prepares a batch of DNA sequences for the model.
-
-#         Handles different label formats based on task type:
-#         - Classification (single-task): uses long int for CrossEntropyLoss
-#         - Classification (multi-task): uses float for BCEWithLogitsLoss
-#         - Regression: uses float
-#         - MLM: masks tokens for pretraining
-#         """
-#         sequences_batch, y, w = batch
-        
-#         # Add
-#         if isinstance(sequences_batch, np.ndarray):
-#             sequences_list = sequences_batch.tolist()
-#         else:
-#             sequences_list = list(sequences_batch)
-#         tokens = self.tokenizer(
-#             # sequences_batch[0].tolist(),
-#             sequences_list, #Added
-#             padding=True,
-#             truncation=True,
-#             return_tensors="pt"
-#         )
-
-#         if self.task == 'mlm':
-#             inputs, labels = self.data_collator.torch_mask_tokens(
-#                 tokens['input_ids']
-#             )
-#             inputs = {
-#                 'input_ids': inputs.to(self.device),
-#                 'labels': labels.to(self.device),
-#                 'attention_mask': tokens['attention_mask'].to(self.device),
-#             }
-#             return inputs, None, w
-        
-#         elif self.task in ['regression', 'classification']:
-#             if y is not None:
-#                 # y = torch.from_numpy(y[0])
-#                 y = torch.from_numpy(y)
-#                 if self.task == 'regression':
-#                     y = y.float().to(self.device)
-#                 elif self.task == 'classification':
-#                     if self.n_tasks == 1:
-#                         y = y.long().to(self.device)
-#                     else:
-#                         y = y.float().to(self.device)
-            
-#             for key, value in tokens.items():
-#                 tokens[key] = value.to(self.device)
-
-#             inputs = {**tokens, 'labels': y}
-#             return inputs, y, w
