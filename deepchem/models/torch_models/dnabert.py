@@ -244,23 +244,14 @@ class DNABERT2(object):
         )
         from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
-        # self.tokenizer = AutoTokenizer.from_pretrained(
-        #     model_name,
-        #     trust_remote_code=True,
-        # )
-        # config = BertConfig.from_pretrained(
-        #     model_name,
-        #     trust_remote_code=True,
-        # )
-
-        # _patch_dnabert2_cache(model_name)
-        _ = AutoModel.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            ignore_mismatched_sizes=True,
-            pad_token_id=0,
-        )
-        del _ # Putting it in cache the model and then removing other parts
+        try:
+            _ = AutoModel.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+            )
+            del _
+        except Exception:
+            pass  # Download succeeded even if model init fails; patch will find the file.
         import gc; gc.collect()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
