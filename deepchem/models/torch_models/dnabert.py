@@ -26,6 +26,12 @@ try:
 except ImportError:
     has_transformers = False
 
+try:
+    from deepchem.models.torch_models.hf_models import HuggingFaceModel
+    has_deepchem = True
+except ImportError:
+    has_deepchem = False
+
 
 def _patch_dnabert2_cache(
     model_name: str = "zhihan1996/DNABERT-2-117M"
@@ -92,7 +98,7 @@ def _patch_dnabert2_cache(
             logger.debug("DNABERT-2 ALiBi patch already applied: %s", path)
 
 
-class DNABERT2(object):
+class DNABERT2(HuggingFaceModel):
     """DNABERT-2 Model for DNA sequence analysis.
 
     DNABERT-2 is a foundation model for DNA sequences based on the
@@ -241,7 +247,6 @@ class DNABERT2(object):
             AutoTokenizer,
             BertConfig,
         )
-        from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
         # Pull bert_layers.py into the HF modules cache before patching.
         # AutoModel is the only call that reliably triggers the download of
