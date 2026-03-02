@@ -30,7 +30,7 @@ try:
     from deepchem.models.torch_models.hf_models import HuggingFaceModel
     has_deepchem = True
 except ImportError:
-    has_deepchem = False
+    has_deepchem = False # ?????
 
 
 def _patch_dnabert2_cache(
@@ -51,7 +51,7 @@ def _patch_dnabert2_cache(
 
     2. **Flash-Attention / Triton**: controlled externally via
        ``config.attention_probs_dropout_prob > 0`` so no file-level
-       patch is needed.
+       patch is needed. # main thing --------------------------------------- need to remove this comment
 
     Both patches are idempotent — safe to run multiple times.
 
@@ -103,7 +103,7 @@ class DNABERT2(HuggingFaceModel):
 
     DNABERT-2 is a foundation model for DNA sequences based on the
     MosaicBERT architecture with Byte-Pair Encoding (BPE) tokenization.
-    It replaces the k-mer tokenisation used in the original DNABERT with
+    It replaces the k-mer tokenization used in the original DNABERT with
     a data-driven BPE vocabulary that generalises across species and
     sequence types.
 
@@ -403,7 +403,7 @@ class DNABERT2(HuggingFaceModel):
             ``(inputs_dict, y_tensor, w)`` ready for ``model.forward``.
         """
         X, y, w = batch
-        sequences = np.array(X).ravel().tolist()
+        sequences = np.array(X[0]).ravel().tolist()
 
         tokens = self.tokenizer(
             sequences,
@@ -427,7 +427,8 @@ class DNABERT2(HuggingFaceModel):
         inputs = {k: v.to(self.device) for k, v in tokens.items()}
 
         if y is not None:
-            y_tensor = torch.from_numpy(np.asarray(y))
+            # y_tensor = torch.from_numpy(np.asarray(y))
+            y_tensor = torch.from_numpy(np.asarray(y[0]))
             if self.task == "classification" and self.n_tasks == 1:
                 y_tensor = y_tensor.view(-1).long().to(self.device)
             else:
