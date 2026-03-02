@@ -288,6 +288,7 @@ class DNABERT2(HuggingFaceModel):
             config.problem_type = "regression"
 
         if task == "mlm":
+            config.tie_word_embeddings=False
             model = AutoModelForMaskedLM.from_pretrained(
                 model_name, config=config, trust_remote_code=True
             )
