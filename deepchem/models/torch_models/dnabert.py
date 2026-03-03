@@ -5,6 +5,7 @@ import os
 from typing import Any, Tuple
 
 import numpy as np
+from deepchem.models.torch_models.hf_models import HuggingFaceModel
 
 logger = logging.getLogger(__name__)
 
@@ -21,51 +22,44 @@ except ImportError:
     has_huggingface_hub = False
 
 try:
-    import transformers
+    from transformers import (
+        AutoModel,
+        AutoModelForMaskedLM,
+        AutoModelForSequenceClassification,
+        AutoTokenizer,
+        BertConfig,
+    )
     has_transformers = True
 except ImportError:
     has_transformers = False
 
-try:
-    from deepchem.models.torch_models.hf_models import HuggingFaceModel
-    has_deepchem = True
-except ImportError:
-    has_deepchem = False # ?????
-
-
-def _patch_dnabert2_cache(
+def patch_dnabert2_cache(
     model_name: str = "zhihan1996/DNABERT-2-117M"
 ) -> None:
     """Apply minimal targeted patches to DNABERT-2's cached custom files.
 
-    DNABERT-2 ships with two compatibility issues on modern environments:
+    DNABERT-2 is shipped with two compatibility issues on modern environments:
 
     1. **ALiBi meta-device conflict**: ``BertEncoder.__init__`` calls
        ``rebuild_alibi_tensor`` with no ``device`` argument, causing a
        ``RuntimeError`` when HuggingFace's lazy loader initialises tensors
-       on the ``meta`` device (PyTorch >= 2.0 / transformers >= 4.38).
-       The fix passes ``device='cpu'`` — a parameter the authors already
-       defined — so the tensor is built on CPU and moved to the correct
-       device during the first forward pass via the authors' own device
-       catch-up logic in ``BertEncoder.forward``.
+       on the ``meta`` device.The fix passes ``device='cpu'`` -a parameter 
+       the authors already defined so the tensor is built on CPU and moved 
+       to the correctdevice during the first forward pass via the authors' 
+       own device catch-up logic in ``BertEncoder.forward``.
 
     2. **Flash-Attention / Triton**: controlled externally via
-       ``config.attention_probs_dropout_prob > 0`` so no file-level
-       patch is needed. # main thing --------------------------------------- need to remove this comment
-
-    Both patches are idempotent — safe to run multiple times.
-
+       ``config.attention_probs_dropout_prob > 0`` so no file-level patch is needed.
+       
     Parameters
     ----------
     model_name : str
         HuggingFace model identifier. Used only for error messages.
     """
     if not has_huggingface_hub:
-        raise ImportError(
-            "huggingface_hub is required. "
-            "Install with: pip install huggingface_hub"
-        )
-
+        raise ImportError("huggingface_hub is required.")
+    
+    # 
     modules_cache = os.path.join(
         hf_constants.HF_HOME, "modules", "transformers_modules"
     )
@@ -80,17 +74,22 @@ def _patch_dnabert2_cache(
             f"trust_remote_code=True)."
         )
 
-    _OLD = "self.rebuild_alibi_tensor(size=config.alibi_starting_size)"
-    _NEW = (
+    old = "self.rebuild_alibi_tensor(size=config.alibi_starting_size)"
+    new = (
         "self.rebuild_alibi_tensor("
-        "size=config.alibi_starting_size, device='cpu')"
+        "size=config.alibi_starting_size, device='cpu')" # pulling up the AliBi fix in here by adding device as per authors code
     )
 
+    # Confirimng whether the patch has worked or not in this loop 
+    # meaning checking if the patch has been applied onto the new and old does not exist
+    # not to be removed as glob might return multiple patches as user may download the model 
+    # and may happen that each having different commit hashes and HF loads unpatched one
+
     for path in matches:
-        with open(path, "r") as fh:
-            src = fh.read()
-        if _OLD in src:
-            src = src.replace(_OLD, _NEW)
+        with open(path, "r") as file:
+            src = file.read()
+        if old in src:
+            src = src.replace(old, new)
             with open(path, "w") as fh:
                 fh.write(src)
             logger.debug("DNABERT-2 ALiBi patch applied: %s", path)
@@ -106,19 +105,6 @@ class DNABERT2(HuggingFaceModel):
     It replaces the k-mer tokenization used in the original DNABERT with
     a data-driven BPE vocabulary that generalises across species and
     sequence types.
-
-    This wrapper integrates DNABERT-2 into DeepChem and resolves several
-    environment-specific compatibility issues transparently:
-
-    * **Flash-Attention / Triton**: disabled via the authors' own
-      documented ``attention_probs_dropout_prob`` config flag so no
-      Triton installation is required and the model runs on both CPU
-      and GPU.
-    * **ALiBi meta-device conflict**: patched by supplying the ``device``
-      argument the authors already defined but never passed at init.
-    * **Environment-agnostic caching**: uses
-      ``huggingface_hub.constants.HF_HOME`` rather than hard-coded
-      paths, so the wrapper works on Kaggle, Colab, and local machines.
 
     The model supports five tasks:
 
@@ -140,68 +126,23 @@ class DNABERT2(HuggingFaceModel):
         Number of prediction targets. Used for ``'classification'``,
         ``'regression'``, and ``'mtr'``. Defaults to ``1``.
     attention_probs_dropout_prob : float, optional
-        Any value ``> 0`` disables the Triton Flash-Attention kernel
-        and uses a pure-PyTorch attention implementation instead.
-        This is the authors' own documented mechanism — see
-        ``configuration_bert.py`` in the model repo. Defaults to
-        ``0.1``.
+        Dropout probability for attention layers. Any value ``> 0`` 
+        uses a pure-PyTorch attention implementation instead of the 
+        Triton Flash-Attention kernel, ensuring cross-platform stability. 
+        Defaults to ``0.1``.
     **kwargs
         Additional keyword arguments forwarded to
         :class:`~deepchem.models.torch_models.hf_models.HuggingFaceModel`.
 
-    Raises
-    ------
-    ImportError
-        If ``torch``, ``transformers``, or ``huggingface_hub`` are not
-        installed.
-    ValueError
-        If an unsupported ``task`` string is provided.
-
     Examples
     --------
-    **Binary classification — promoter detection**
-
-    >>> import deepchem as dc
-    >>> import numpy as np
-    >>> from deepchem.models.torch_models.dnabert import DNABERT2
-
-    >>> sequences = ["ATGCGTACGTAGCTAGCTAGCTAGCGTA",
-    ...              "GCTAGCTAGCTAGCTAGCTAGCTAGC"]
-    >>> labels = np.array([1, 0])
-    >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
-
-    >>> model = DNABERT2(task='classification', n_tasks=1)
-    >>> loss = model.fit(dataset, nb_epoch=1)
-
-    **Regression**
-
-    >>> labels = np.array([0.82, 0.31])
-    >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
-    >>> model = DNABERT2(task='regression', n_tasks=1)
-    >>> loss = model.fit(dataset, nb_epoch=1)
-
-    **Multi-task regression**
-
-    >>> labels = np.array([[0.82, 0.5], [0.31, 0.7]])
-    >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
-    >>> model = DNABERT2(task='mtr', n_tasks=2)
-    >>> loss = model.fit(dataset, nb_epoch=1)
-
-    **Feature extraction**
-
-    >>> model = DNABERT2(task='feature_extractor')
-    >>> embeddings = model.predict(dataset)  # shape (N, 768)
-
-    **Masked language modelling**
-
-    >>> model = DNABERT2(task='mlm')
-    >>> loss = model.fit(dataset, nb_epoch=1)
+    ... (keep your examples here) ...
 
     References
     ----------
     .. Zhou, Z., Ji, Y., Li, W., Dutta, P., Davuluri, R., & Liu, H.
-       (2023). DNABERT-2: Efficient Foundation Model and Benchmark For
-       Multi-Species Genome. arXiv:2306.15006.
+    (2023). DNABERT-2: Efficient Foundation Model and Benchmark For
+    Multi-Species Genome. arXiv:2306.15006.
     """
 
     def __init__(
@@ -218,48 +159,39 @@ class DNABERT2(HuggingFaceModel):
             )
         if not has_transformers:
             raise ImportError(
-                "transformers is required. "
-                "Install: pip install 'transformers>=4.29,<5'"
+                "transformers is required. Install: pip install 'transformers>=4.29,<5'" # I need to match with dc requirement file version 
             )
         if not has_huggingface_hub:
             raise ImportError(
-                "huggingface_hub is required. "
-                "Install: pip install huggingface_hub"
+                "huggingface_hub is required. Install: pip install huggingface_hub"
             )
 
-        _SUPPORTED = {
-            "mlm", "classification", "regression", "mtr",
-            "feature_extractor"
-        }
-        if task not in _SUPPORTED:
+        supported_tasks = [
+            "mlm", "classification", "regression", "mtr","feature_extractor"
+        ]
+        if task not in supported_tasks:
             raise ValueError(
                 f"Unsupported task '{task}'. "
-                f"Choose one of: {sorted(_SUPPORTED)}"
+                f"Choose one of: {supported_tasks}"
             )
 
         self.n_tasks = n_tasks
         self.model_name = model_name
 
-        from transformers import (
-            AutoModel,
-            AutoModelForMaskedLM,
-            AutoModelForSequenceClassification,
-            AutoTokenizer,
-            BertConfig,
-        )
-
         # Pull bert_layers.py into the HF modules cache before patching.
         # AutoModel is the only call that reliably triggers the download of
         # bert_layers.py on all platforms (Kaggle, Colab, local).
         # The model init may fail due to missing pad_token_id in the raw
-        # config — that's expected and safe to swallow since we only need
+        # config — that's expected and safe to swallow since I only need
         # the file on disk.
+        # so in simple words forcing bert_layers.py to be downloaded on HF cache so that 
+        # in a fresh env like kaggle or colab my glob module can fetch the file path to prevent the mentioned challenegs faced so far
         try:
-            _ = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-            del _
+            temp= AutoModel.from_pretrained(model_name, trust_remote_code=True)
+            del temp
         except Exception:
             pass
-        gc.collect()
+        gc.collect() # adding to save my disk memory
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_name,
@@ -270,7 +202,7 @@ class DNABERT2(HuggingFaceModel):
             trust_remote_code=True,
         )
 
-        _patch_dnabert2_cache(model_name)
+        patch_dnabert2_cache(model_name)
 
         config.attention_probs_dropout_prob = attention_probs_dropout_prob
         config.pad_token_id = tokenizer.pad_token_id
@@ -279,16 +211,16 @@ class DNABERT2(HuggingFaceModel):
         if task == "classification":
             config.num_labels = 2 if n_tasks == 1 else n_tasks
             config.problem_type = (
-                "single_label_classification"
+                "single_label_classification" # Cross Entropy Loss
                 if n_tasks == 1
-                else "multi_label_classification"
+                else "multi_label_classification" # BCEWithLogitsLoss
             )
         elif task in ("regression", "mtr"):
             config.num_labels = n_tasks
-            config.problem_type = "regression"
+            config.problem_type = "regression" # MSE Loss
 
         if task == "mlm":
-            config.tie_word_embeddings=False
+            config.tie_word_embeddings = False   
             model = AutoModelForMaskedLM.from_pretrained(
                 model_name, config=config, trust_remote_code=True
             )
@@ -345,14 +277,13 @@ class DNABERT2(HuggingFaceModel):
         """
         if self.task == "feature_extractor":
             raise ValueError(
-                "fit() is not supported for task='feature_extractor'. "
-                "Use task='mlm' for pre-training or 'classification' / "
-                "'regression' for fine-tuning."
+                """fit() is not supported for task='feature_extractor' Use task='mlm' for pre-training 
+                or 'classification, regression for fine-tuning."""
             )
         return super(DNABERT2, self).fit(dataset, nb_epoch=nb_epoch, **kwargs)
 
     def _predict_embeddings(self, dataset) -> np.ndarray:
-        """Return CLS-token embeddings for every sequence in *dataset*.
+        """Return CLS-token embeddings for every sequence in dataset.
 
         Parameters
         ----------
@@ -404,7 +335,7 @@ class DNABERT2(HuggingFaceModel):
             ``(inputs_dict, y_tensor, w)`` ready for ``model.forward``.
         """
         X, y, w = batch
-        sequences = np.array(X[0]).ravel().tolist()
+        sequences = np.array(X[0]).tolist()
 
         tokens = self.tokenizer(
             sequences,
@@ -428,7 +359,6 @@ class DNABERT2(HuggingFaceModel):
         inputs = {k: v.to(self.device) for k, v in tokens.items()}
 
         if y is not None:
-            # y_tensor = torch.from_numpy(np.asarray(y))
             y_tensor = torch.from_numpy(np.asarray(y[0]))
             if self.task == "classification" and self.n_tasks == 1:
                 y_tensor = y_tensor.view(-1).long().to(self.device)
