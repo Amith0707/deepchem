@@ -59,7 +59,6 @@ def patch_dnabert2_cache(
     if not has_huggingface_hub:
         raise ImportError("huggingface_hub is required.")
     
-    # 
     modules_cache = os.path.join(
         hf_constants.HF_HOME, "modules", "transformers_modules"
     )
@@ -136,7 +135,21 @@ class DNABERT2(HuggingFaceModel):
 
     Examples
     --------
-    ... (keep your examples here) ...
+    >>> import deepchem as dc
+    >>> from deepchem.models.torch_models.dnabert import DNABERT2
+
+    >>> # Classification
+    >>> sequences = ["ATCGATCG", "GCTAGCTA", "TTAACCGG"]
+    >>> labels = [0, 1, 0]
+    >>> dataset = dc.data.NumpyDataset(X=sequences, y=labels)
+    >>> model = DNABERT2(task='classification', model_dir='/tmp/dnabert2')
+    >>> loss = model.fit(dataset, nb_epoch=1)
+
+    >>> # Feature extraction
+    >>> model = DNABERT2(task='feature_extractor', model_dir='/tmp/dnabert2')
+    >>> embeddings = model.predict(dataset)
+    >>> embeddings.shape
+    (3, 768)
 
     References
     ----------
@@ -159,7 +172,7 @@ class DNABERT2(HuggingFaceModel):
             )
         if not has_transformers:
             raise ImportError(
-                "transformers is required. Install: pip install 'transformers>=4.29,<5'" # I need to match with dc requirement file version 
+                "transformers is required. Install: pip install transformers>=4.29,<5" 
             )
         if not has_huggingface_hub:
             raise ImportError(
@@ -240,7 +253,7 @@ class DNABERT2(HuggingFaceModel):
             **kwargs,
         )
 
-    def predict(self, dataset, **kwargs):
+    def predict(self, dataset, transformers=[],**kwargs):
         """Run inference.
 
         Parameters
@@ -258,7 +271,7 @@ class DNABERT2(HuggingFaceModel):
         """
         if self.task == "feature_extractor":
             return self._predict_embeddings(dataset)
-        return super(DNABERT2, self).predict(dataset, **kwargs)
+        return super(DNABERT2, self).predict(dataset,transformers=transformers, **kwargs)
 
     def fit(self, dataset, nb_epoch: int = 1, **kwargs):
         """Train the model.
